@@ -1,104 +1,808 @@
 from web_data.web_data import get_all_text_with_metadata
-from pdf_data.pdf_data import load_and_chunk_pdfs
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from sentence_transformers import CrossEncoder
-
-
-# For local
-# VECTOR_DB_PATH = "data/faiss_index"
-
-# For deployment on rendor
 import os
-VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "data/faiss_index")
+import shutil
+import re
+
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+VECTOR_DB_PATH = "data/faiss_index"
+
+# Increased threshold to filter out more irrelevant content
+RELEVANCE_THRESHOLD = -2.5  # More strict than -3.5
+
+# Fewer candidates → faster CrossEncoder, still good quality
+CANDIDATE_MULTIPLIER = 4
+
+# ─────────────────────────────────────────────
+# In-memory caches to avoid reloading heavy models/indexes every query
+# ─────────────────────────────────────────────
+_embedding_model = None
+_vector_store_cache = None
+_all_chunks_cache = None
+_web_chunks_cache = None
+_pdf_chunks_cache = None
+_bm25_cache = None
+_reranker_cache = None
+
+
+# ─────────────────────────────────────────────
+# Query Classification
+# ─────────────────────────────────────────────
+
+def classify_query_intent(query: str) -> str:
+    """
+    Detect if query is asking for:
+    - 'information' (how-to, what is, services, process)
+    - 'form' (registration, what documents needed)
+    - 'general' (unclear/mixed)
+    
+    Returns: 'information', 'form', or 'general'
+    """
+    q_lower = query.lower()
+    
+    # Informational query indicators
+    info_keywords = [
+        'how', 'what', 'when', 'where', 'can i', 'wie kann', 
+        'book', 'appointment', 'termin', 'buchen', 'contact',
+        'phone', 'email', 'opening hours', 'services', 'treatment',
+        'cost', 'price', 'insurance', 'process', 'procedure',
+        'öffnungszeiten', 'kontakt', 'telefon', 'angebot'
+    ]
+    
+    # Form-related query indicators
+    form_keywords = [
+        'registration', 'anmeldung', 'form', 'formular',
+        'documents needed', 'what information', 'fill out',
+        'patient form', 'which documents', 'bring to appointment'
+    ]
+    
+    info_count = sum(1 for kw in info_keywords if kw in q_lower)
+    form_count = sum(1 for kw in form_keywords if kw in q_lower)
+    
+    if info_count > form_count:
+        return 'information'
+    elif form_count > info_count:
+        return 'form'
+    else:
+        return 'general'
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def normalize_query(query: str) -> str:
+    """
+    Normalize query text for BM25:
+    - Lowercase
+    - Remove clinic name tokens like "functiomed"
+    - Collapse whitespace
+    """
+    q = query.strip().lower()
+    # Remove brand/clinic name so BM25 focuses on the intent words
+    q = re.sub(r"\bfunctiomed\b", " ", q)
+    q = re.sub(r"\s+", " ", q)
+    return q
 
 
 def load_all_chunks():
-    web_docs = get_all_text_with_metadata()
-    pdf_docs = load_and_chunk_pdfs()
-    return web_docs + pdf_docs
+    """
+    Load all chunks from data/clean_text/ (web + PDF).
+    Cached in-memory so we only hit disk + splitter once.
+    """
+    global _all_chunks_cache, _web_chunks_cache, _pdf_chunks_cache
+
+    if _all_chunks_cache is not None:
+        return _all_chunks_cache, _web_chunks_cache, _pdf_chunks_cache
+
+    print("\n" + "=" * 70)
+    print("📚 LOADING ALL DOCUMENT CHUNKS  (web + pdf from clean_text/)")
+    print("=" * 70)
+
+    all_chunks = get_all_text_with_metadata()
+
+    web_chunks = [c for c in all_chunks if c.metadata.get("source_type") == "web"]
+    pdf_chunks = [c for c in all_chunks if c.metadata.get("source_type") == "pdf"]
+
+    print(f"\n📊 SUMMARY:")
+    print(f"    • Web chunks : {len(web_chunks):,}")
+    print(f"    • PDF chunks : {len(pdf_chunks):,}")
+    print(f"    • TOTAL      : {len(all_chunks):,}")
+    print("=" * 70 + "\n")
+
+    _all_chunks_cache = all_chunks
+    _web_chunks_cache = web_chunks
+    _pdf_chunks_cache = pdf_chunks
+
+    return all_chunks, web_chunks, pdf_chunks
 
 
-def build_or_load_vectorstore():
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="paraphrase-multilingual-mpnet-base-v2",  #
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
+def build_or_load_vectorstore(force_rebuild: bool = False):
+    """
+    Build a new FAISS index or load an existing one.
+    Uses in-memory cache so we don't reload the model/index on every query.
+    """
+    global _embedding_model, _vector_store_cache
+
+    print("\n" + "=" * 70)
+    print("🔧 VECTOR STORE INITIALIZATION")
+    print("=" * 70)
+
+    # Lazy-load embedding model once
+    if _embedding_model is None:
+        print("\n📦 Loading embedding model: paraphrase-multilingual-mpnet-base-v2 ...")
+        _embedding_model = HuggingFaceEmbeddings(
+            model_name="paraphrase-multilingual-mpnet-base-v2",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+        print("    ✅ Embedding model loaded")
+
+    # On force rebuild, drop on-disk index and in-memory cache
+    if force_rebuild and os.path.exists(VECTOR_DB_PATH):
+        print(f"\n🗑️  FORCE REBUILD — deleting {VECTOR_DB_PATH}")
+        shutil.rmtree(VECTOR_DB_PATH)
+        print("    ✅ Old index deleted")
+        _vector_store_cache = None
+
+    # If we already have an in-memory vector store and not forcing rebuild, reuse it
+    if _vector_store_cache is not None and not force_rebuild:
+        print("\n📂 Using cached in-memory FAISS index")
+        print("=" * 70 + "\n")
+        return _vector_store_cache
 
     try:
-        # Load existing FAISS index
-        vector_store = FAISS.load_local(
-            VECTOR_DB_PATH,
-            embedding_model,
-            allow_dangerous_deserialization=True
-        )
-        return vector_store
+        if os.path.exists(VECTOR_DB_PATH) and not force_rebuild:
+            print(f"\n📂 Loading existing index from {VECTOR_DB_PATH} ...")
+            _vector_store_cache = FAISS.load_local(
+                VECTOR_DB_PATH,
+                _embedding_model,
+                allow_dangerous_deserialization=True,
+            )
+            print("    ✅ Index loaded successfully!")
+            print("=" * 70 + "\n")
+            return _vector_store_cache
+        else:
+            raise FileNotFoundError("No index found or force rebuild requested")
 
-    except Exception:
-        # Build new index
-        docs = load_all_chunks()
-        vector_store = FAISS.from_documents(
-            documents=docs,
-            embedding=embedding_model
+    except Exception as e:
+        print(f"\n🔨 BUILDING NEW FAISS INDEX")
+        print(f"    Reason: {e}")
+
+        all_docs, _, _ = load_all_chunks()
+
+        if not all_docs:
+            raise ValueError("No documents found!")
+
+        print(f"\n🧮 Creating embeddings for {len(all_docs):,} chunks ...")
+        _vector_store_cache = FAISS.from_documents(
+            documents=all_docs,
+            embedding=_embedding_model,
         )
-        vector_store.save_local(VECTOR_DB_PATH)
-        return vector_store
+
+        print(f"\n💾 Saving index to {VECTOR_DB_PATH} ...")
+        _vector_store_cache.save_local(VECTOR_DB_PATH)
+        print("    ✅ Saved!")
+        print("=" * 70 + "\n")
+
+        return _vector_store_cache
 
 
 def load_reranker():
-    # Load CrossEncoder reranker
-    return CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
-                        
+    """Load CrossEncoder reranker (cached in memory)."""
+    global _reranker_cache
+    if _reranker_cache is None:
+        print("\n📦 Loading CrossEncoder reranker (this may take a moment) ...")
+        _reranker_cache = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+        print("    ✅ Reranker loaded")
+    return _reranker_cache
 
 
-def retrieve(query: str, top_n: int = 5):
+def get_bm25(all_chunks):
+    """Build BM25 retriever once and reuse it."""
+    global _bm25_cache
+    if _bm25_cache is None:
+        print("\n📦 Building BM25 index (first query only) ...")
+        _bm25_cache = BM25Retriever.from_documents(all_chunks, bm25_variant="plus")
+    return _bm25_cache
+
+
+def _deduplicate(docs: list) -> list:
+    """Remove duplicates by page_content."""
+    seen, unique = set(), []
+    for doc in docs:
+        key = hash(doc.page_content)
+        if key not in seen:
+            unique.append(doc)
+            seen.add(key)
+    return unique
+
+
+# ─────────────────────────────────────────────
+# MAIN RETRIEVAL
+# ─────────────────────────────────────────────
+
+def retrieve(query: str, top_n: int = 6) -> list:
     """
-    Hybrid retrieval: FAISS + BM25 + CrossEncoder reranking
+    Query-aware adaptive retrieval:
+    - Detects query intent (information vs form)
+    - For information queries: Heavily boosts web content
+    - For form queries: Allows more PDF content
+    - Uses strict relevance filtering
     """
     try:
-        # Load vector store and all chunks
-        vector_store = build_or_load_vectorstore()
-        all_chunks = load_all_chunks()
+        print("\n" + "=" * 70)
+        print("🔍 QUERY-AWARE ADAPTIVE RETRIEVAL")
+        print("=" * 70)
+        print(f"Original query  : '{query}'")
 
-        # 1️⃣ FAISS retrieval
+        # Classify query intent
+        intent = classify_query_intent(query)
+        print(f"Query intent    : {intent.upper()}")
+        
+        # Set additive boost based on intent
+        if intent == 'information':
+            web_boost = 3.0  # Strong additive boost for web chunks
+            print(f"Strategy        : INFORMATION → Additive web boost +3.0")
+        elif intent == 'form':
+            web_boost = 0.0  # Neutral for form-related questions
+            print(f"Strategy        : FORM → Neutral (no web boost)")
+        else:
+            web_boost = 1.5  # Moderate additive boost
+            print(f"Strategy        : GENERAL → Additive web boost +1.5")
+
+        normalized_q = normalize_query(query)
+        print(f"Normalized query: '{normalized_q}'")
+        print(f"Target          : {top_n} docs  |  Threshold: {RELEVANCE_THRESHOLD}")
+
+        # Load resources
+        vector_store = build_or_load_vectorstore()
+        all_chunks, web_chunks, pdf_chunks = load_all_chunks()
+
+        n_candidates = top_n * CANDIDATE_MULTIPLIER
+        print(f"\n📊 Available: {len(web_chunks)} web  |  {len(pdf_chunks)} PDF")
+        print(f"    Fetching {n_candidates} candidates from each retriever")
+
+        # STEP 1: FAISS
+        print(f"\n🔹 STEP 1: FAISS Semantic Search  (k={n_candidates})")
         faiss_retriever = vector_store.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": top_n * 2}  # retrieve extra for reranking
+            search_kwargs={"k": n_candidates},
         )
         faiss_docs = faiss_retriever.invoke(query)
+        faiss_web = [d for d in faiss_docs if d.metadata.get("source_type") == "web"]
+        faiss_pdf = [d for d in faiss_docs if d.metadata.get("source_type") == "pdf"]
+        print(f"    Retrieved: {len(faiss_web)} web  |  {len(faiss_pdf)} PDF")
 
-        # 2️⃣ BM25 retrieval
-        bm25 = BM25Retriever.from_documents(all_chunks, bm25_variant="plus")
-        bm25.k = top_n * 2
-        bm25_docs = bm25.invoke(query)
+        # STEP 2: BM25
+        print(f"\n🔹 STEP 2: BM25 Keyword Search  (k={n_candidates})")
+        bm25 = get_bm25(all_chunks)
+        bm25.k = n_candidates
+        bm25_docs = bm25.invoke(normalized_q)
+        bm25_web = [d for d in bm25_docs if d.metadata.get("source_type") == "web"]
+        bm25_pdf = [d for d in bm25_docs if d.metadata.get("source_type") == "pdf"]
+        print(f"    Retrieved: {len(bm25_web)} web  |  {len(bm25_pdf)} PDF")
 
-        # 3️⃣ Combine and deduplicate
-        combined_docs = []
-        seen = set()
-        for doc in faiss_docs + bm25_docs:
-            if doc.page_content not in seen:
-                combined_docs.append(doc)
-                seen.add(doc.page_content)
+        # STEP 3: Combine
+        print(f"\n🔹 STEP 3: Combine & Deduplicate")
+        combined = _deduplicate(faiss_docs + bm25_docs)
+        print(f"    Unique candidates: {len(combined)}")
 
-        if not combined_docs:
+        if not combined:
+            print("    ⚠️  No candidates found.")
             return []
 
-        # 4️⃣ Rerank using CrossEncoder
+        # STEP 4: Rerank
+        print(f"\n🔹 STEP 4: CrossEncoder Reranking with Intent-Based Boost")
         reranker = load_reranker()
-        pairs = [[query, doc.page_content] for doc in combined_docs]
+        pairs = [[query, doc.page_content] for doc in combined]
         scores = reranker.predict(pairs)
 
-        ranked_docs = sorted(
-            zip(combined_docs, scores),
-            key=lambda x: x[1],
+        # Apply web boost (additive so higher = better, even when scores are negative)
+        boosted_scores = []
+        for doc, score in zip(combined, scores):
+            if doc.metadata.get("source_type") == "web":
+                boosted_score = score + web_boost
+            else:
+                boosted_score = score
+            boosted_scores.append(boosted_score)
+
+        ranked = sorted(
+            zip(combined, boosted_scores, scores),  # Keep original scores
+            key=lambda x: x[1],  # Sort by boosted score
             reverse=True
         )
+        
+        print(f"    Original score range: {max(scores):.4f} → {min(scores):.4f}")
+        print(f"    Boosted score range:  {max(boosted_scores):.4f} → {min(boosted_scores):.4f}")
 
-        # Return top N after reranking
-        return [doc for doc, score in ranked_docs[:top_n]]
+        # STEP 5: Threshold filter
+        print(f"\n🔹 STEP 5: Relevance Filter (boosted >= {RELEVANCE_THRESHOLD})")
+        above = [(d, bs, os) for d, bs, os in ranked if bs >= RELEVANCE_THRESHOLD]
+        below = [(d, bs, os) for d, bs, os in ranked if bs < RELEVANCE_THRESHOLD]
+        print(f"    Above threshold: {len(above)}   |   Discarded (below threshold): {len(below)}")
+
+        if not above:
+            # No hits above threshold → just take the best overall
+            print(f"    ⚠️  All below threshold — taking top {top_n} by boosted score")
+            candidate_pool = ranked[:top_n]
+        elif len(above) >= top_n:
+            # Plenty of good hits → just use the top-N above threshold
+            candidate_pool = above[:top_n]
+        else:
+            # Too few above threshold → fill the rest from below-threshold docs
+            need = top_n - len(above)
+            print(f"    ℹ️  Only {len(above)} above threshold — adding {need} best below-threshold docs")
+            candidate_pool = above + below[:need]
+
+        # Extract final docs
+        final_docs = [doc for doc, _, _ in candidate_pool]
+        
+        actual_web = sum(1 for d in final_docs if d.metadata.get("source_type") == "web")
+        actual_pdf = sum(1 for d in final_docs if d.metadata.get("source_type") == "pdf")
+
+        # Summary
+        print(f"\n📊 FINAL RESULTS:")
+        print("=" * 70)
+        print(f"    • Web  : {actual_web}")
+        print(f"    • PDF  : {actual_pdf}")
+        print(f"    • Total: {len(final_docs)} (target: {top_n})")
+
+        for i, (doc, boosted, original) in enumerate(candidate_pool, 1):
+            stype = doc.metadata.get("source_type", "?")
+            icon = "🌐" if stype == "web" else "📑"
+            name = doc.metadata.get("page_name") or doc.metadata.get("source_pdf", "Unknown")
+            boost_note = f" (from {original:.4f})" if boosted != original else ""
+            
+            print(f"\n    {i}. {icon} [{stype.upper()}] {name}")
+            print(f"       Score: {boosted:.4f}{boost_note}")
+            print(f"       Preview: {doc.page_content[:100]}...")
+
+        print("\n" + "=" * 70 + "\n")
+        return final_docs
 
     except Exception as e:
-        print(f"Retrieval error: {str(e)}")
+        print(f"\n❌ RETRIEVAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return []
+    
+    #------------------------------------------NEW VERSIO------------------------------------
+
+
+# from web_data.web_data import get_all_text_with_metadata
+# from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+# from langchain_community.vectorstores import FAISS
+# from langchain_community.retrievers import BM25Retriever
+# from sentence_transformers import CrossEncoder
+# import os
+# import shutil
+# import re
+
+# # ─────────────────────────────────────────────
+# # Config
+# # ─────────────────────────────────────────────
+# VECTOR_DB_PATH = "data/faiss_index"
+
+# # Increased threshold to filter out more irrelevant content
+# RELEVANCE_THRESHOLD = -2.5  # More strict than -3.5
+
+# # Fewer candidates → faster CrossEncoder, still good quality
+# # With smaller chunks (500 chars), we have ~2x more chunks total,
+# # so we can reduce candidates while maintaining coverage
+# CANDIDATE_MULTIPLIER = 3  # Reduced from 4
+
+# # ─────────────────────────────────────────────
+# # In-memory caches to avoid reloading heavy models/indexes every query
+# # ─────────────────────────────────────────────
+# _embedding_model = None
+# _vector_store_cache = None
+# _all_chunks_cache = None
+# _web_chunks_cache = None
+# _pdf_chunks_cache = None
+# _bm25_cache = None
+# _reranker_cache = None
+
+
+# # ─────────────────────────────────────────────
+# # Query Classification
+# # ─────────────────────────────────────────────
+
+# def classify_query_intent(query: str) -> str:
+#     """
+#     Detect if query is asking for:
+#     - 'information' (how-to, what is, services, process)
+#     - 'form' (registration, what documents needed)
+#     - 'general' (unclear/mixed)
+    
+#     Returns: 'information', 'form', or 'general'
+#     """
+#     q_lower = query.lower()
+    
+#     # Informational query indicators
+#     info_keywords = [
+#         'how', 'what', 'when', 'where', 'can i', 'wie kann', 
+#         'book', 'appointment', 'termin', 'buchen', 'contact',
+#         'phone', 'email', 'opening hours', 'services', 'treatment',
+#         'cost', 'price', 'insurance', 'process', 'procedure',
+#         'öffnungszeiten', 'kontakt', 'telefon', 'angebot'
+#     ]
+    
+#     # Form-related query indicators
+#     form_keywords = [
+#         'registration', 'anmeldung', 'form', 'formular',
+#         'documents needed', 'what information', 'fill out',
+#         'patient form', 'which documents', 'bring to appointment'
+#     ]
+    
+#     info_count = sum(1 for kw in info_keywords if kw in q_lower)
+#     form_count = sum(1 for kw in form_keywords if kw in q_lower)
+    
+#     if info_count > form_count:
+#         return 'information'
+#     elif form_count > info_count:
+#         return 'form'
+#     else:
+#         return 'general'
+
+
+# # ─────────────────────────────────────────────
+# # Helpers
+# # ─────────────────────────────────────────────
+
+# def normalize_query(query: str) -> str:
+#     """
+#     Normalize query text for BM25:
+#     - Lowercase
+#     - Remove clinic name tokens like "functiomed"
+#     - Collapse whitespace
+#     """
+#     q = query.strip().lower()
+#     # Remove brand/clinic name so BM25 focuses on the intent words
+#     q = re.sub(r"\bfunctiomed\b", " ", q)
+#     q = re.sub(r"\s+", " ", q)
+#     return q
+
+
+# def load_all_chunks():
+#     """
+#     Load all chunks from data/clean_text/ (web + PDF).
+#     Cached in-memory so we only hit disk + splitter once.
+#     """
+#     global _all_chunks_cache, _web_chunks_cache, _pdf_chunks_cache
+
+#     if _all_chunks_cache is not None:
+#         return _all_chunks_cache, _web_chunks_cache, _pdf_chunks_cache
+
+#     print("\n" + "=" * 70)
+#     print("📚 LOADING ALL DOCUMENT CHUNKS  (web + pdf from clean_text/)")
+#     print("=" * 70)
+
+#     all_chunks = get_all_text_with_metadata()
+
+#     web_chunks = [c for c in all_chunks if c.metadata.get("source_type") == "web"]
+#     pdf_chunks = [c for c in all_chunks if c.metadata.get("source_type") == "pdf"]
+
+#     print(f"\n📊 SUMMARY:")
+#     print(f"    • Web chunks : {len(web_chunks):,}")
+#     print(f"    • PDF chunks : {len(pdf_chunks):,}")
+#     print(f"    • TOTAL      : {len(all_chunks):,}")
+#     print("=" * 70 + "\n")
+
+#     _all_chunks_cache = all_chunks
+#     _web_chunks_cache = web_chunks
+#     _pdf_chunks_cache = pdf_chunks
+
+#     return all_chunks, web_chunks, pdf_chunks
+
+
+# def build_or_load_vectorstore(force_rebuild: bool = False):
+#     """
+#     Build a new FAISS index or load an existing one.
+#     Uses in-memory cache so we don't reload the model/index on every query.
+#     """
+#     global _embedding_model, _vector_store_cache
+
+#     print("\n" + "=" * 70)
+#     print("🔧 VECTOR STORE INITIALIZATION")
+#     print("=" * 70)
+
+#     # Lazy-load embedding model once
+#     if _embedding_model is None:
+#         print("\n📦 Loading embedding model: paraphrase-multilingual-mpnet-base-v2 ...")
+#         _embedding_model = HuggingFaceEmbeddings(
+#             model_name="paraphrase-multilingual-mpnet-base-v2",
+#             model_kwargs={"device": "cpu"},
+#             encode_kwargs={"normalize_embeddings": True},
+#         )
+#         print("    ✅ Embedding model loaded")
+
+#     # On force rebuild, drop on-disk index and in-memory cache
+#     if force_rebuild and os.path.exists(VECTOR_DB_PATH):
+#         print(f"\n🗑️  FORCE REBUILD — deleting {VECTOR_DB_PATH}")
+#         shutil.rmtree(VECTOR_DB_PATH)
+#         print("    ✅ Old index deleted")
+#         _vector_store_cache = None
+
+#     # If we already have an in-memory vector store and not forcing rebuild, reuse it
+#     if _vector_store_cache is not None and not force_rebuild:
+#         print("\n📂 Using cached in-memory FAISS index")
+#         print("=" * 70 + "\n")
+#         return _vector_store_cache
+
+#     try:
+#         if os.path.exists(VECTOR_DB_PATH) and not force_rebuild:
+#             print(f"\n📂 Loading existing index from {VECTOR_DB_PATH} ...")
+#             _vector_store_cache = FAISS.load_local(
+#                 VECTOR_DB_PATH,
+#                 _embedding_model,
+#                 allow_dangerous_deserialization=True,
+#             )
+#             print("    ✅ Index loaded successfully!")
+#             print("=" * 70 + "\n")
+#             return _vector_store_cache
+#         else:
+#             raise FileNotFoundError("No index found or force rebuild requested")
+
+#     except Exception as e:
+#         print(f"\n🔨 BUILDING NEW FAISS INDEX")
+#         print(f"    Reason: {e}")
+
+#         all_docs, _, _ = load_all_chunks()
+
+#         if not all_docs:
+#             raise ValueError("No documents found!")
+
+#         print(f"\n🧮 Creating embeddings for {len(all_docs):,} chunks ...")
+#         _vector_store_cache = FAISS.from_documents(
+#             documents=all_docs,
+#             embedding=_embedding_model,
+#         )
+
+#         print(f"\n💾 Saving index to {VECTOR_DB_PATH} ...")
+#         _vector_store_cache.save_local(VECTOR_DB_PATH)
+#         print("    ✅ Saved!")
+#         print("=" * 70 + "\n")
+
+#         return _vector_store_cache
+
+
+# def load_reranker():
+#     """Load CrossEncoder reranker (cached in memory)."""
+#     global _reranker_cache
+#     if _reranker_cache is None:
+#         print("\n📦 Loading CrossEncoder reranker (this may take a moment) ...")
+#         try:
+#             # Try primary model first
+#             _reranker_cache = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+#             print("    ✅ Reranker loaded (mmarco-mMiniLMv2-L12)")
+#         except Exception as e:
+#             print(f"    ⚠️ Primary reranker failed, using fallback: {e}")
+#             # Fallback to lighter, more reliable model
+#             _reranker_cache = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+#             print("    ✅ Reranker loaded (ms-marco-MiniLM-L-6)")
+#     return _reranker_cache
+
+
+# def get_bm25(all_chunks):
+#     """Build BM25 retriever once and reuse it."""
+#     global _bm25_cache
+#     if _bm25_cache is None:
+#         print("\n📦 Building BM25 index (first query only) ...")
+#         _bm25_cache = BM25Retriever.from_documents(all_chunks, bm25_variant="plus")
+#     return _bm25_cache
+
+
+# def _deduplicate(docs: list) -> list:
+#     """Remove duplicates by page_content."""
+#     seen, unique = set(), []
+#     for doc in docs:
+#         key = hash(doc.page_content)
+#         if key not in seen:
+#             unique.append(doc)
+#             seen.add(key)
+#     return unique
+
+
+# # ─────────────────────────────────────────────
+# # MAIN RETRIEVAL
+# # ─────────────────────────────────────────────
+
+# def retrieve(query: str, top_n: int = 6) -> list:
+#     """
+#     Query-aware adaptive retrieval:
+#     - Detects query intent (information vs form)
+#     - For information queries: Heavily boosts web content
+#     - For form queries: Allows more PDF content
+#     - Uses strict relevance filtering
+#     """
+#     try:
+#         print("\n" + "=" * 70)
+#         print("🔍 QUERY-AWARE ADAPTIVE RETRIEVAL")
+#         print("=" * 70)
+#         print(f"Original query  : '{query}'")
+
+#         # Classify query intent
+#         intent = classify_query_intent(query)
+#         print(f"Query intent    : {intent.upper()}")
+        
+#         # Set additive boost based on intent
+#         if intent == 'information':
+#             web_boost = 3.0  # Strong additive boost for web chunks
+#             print(f"Strategy        : INFORMATION → Additive web boost +3.0")
+#         elif intent == 'form':
+#             web_boost = 0.0  # Neutral for form-related questions
+#             print(f"Strategy        : FORM → Neutral (no web boost)")
+#         else:
+#             web_boost = 1.5  # Moderate additive boost
+#             print(f"Strategy        : GENERAL → Additive web boost +1.5")
+
+#         normalized_q = normalize_query(query)
+#         print(f"Normalized query: '{normalized_q}'")
+#         print(f"Target          : {top_n} docs  |  Threshold: {RELEVANCE_THRESHOLD}")
+
+#         # Load resources
+#         vector_store = build_or_load_vectorstore()
+#         all_chunks, web_chunks, pdf_chunks = load_all_chunks()
+
+#         n_candidates = top_n * CANDIDATE_MULTIPLIER
+#         print(f"\n📊 Available: {len(web_chunks)} web  |  {len(pdf_chunks)} PDF")
+#         print(f"    Fetching {n_candidates} candidates from each retriever")
+
+#         # STEP 1: FAISS
+#         print(f"\n🔹 STEP 1: FAISS Semantic Search  (k={n_candidates})")
+#         faiss_retriever = vector_store.as_retriever(
+#             search_type="similarity",
+#             search_kwargs={"k": n_candidates},
+#         )
+#         faiss_docs = faiss_retriever.invoke(query)
+#         faiss_web = [d for d in faiss_docs if d.metadata.get("source_type") == "web"]
+#         faiss_pdf = [d for d in faiss_docs if d.metadata.get("source_type") == "pdf"]
+#         print(f"    Retrieved: {len(faiss_web)} web  |  {len(faiss_pdf)} PDF")
+
+#         # STEP 2: BM25
+#         print(f"\n🔹 STEP 2: BM25 Keyword Search  (k={n_candidates})")
+#         bm25 = get_bm25(all_chunks)
+#         bm25.k = n_candidates
+#         bm25_docs = bm25.invoke(normalized_q)
+#         bm25_web = [d for d in bm25_docs if d.metadata.get("source_type") == "web"]
+#         bm25_pdf = [d for d in bm25_docs if d.metadata.get("source_type") == "pdf"]
+#         print(f"    Retrieved: {len(bm25_web)} web  |  {len(bm25_pdf)} PDF")
+
+#         # STEP 3: Combine
+#         print(f"\n🔹 STEP 3: Combine & Deduplicate")
+#         combined = _deduplicate(faiss_docs + bm25_docs)
+#         print(f"    Unique candidates: {len(combined)}")
+
+#         if not combined:
+#             print("    ⚠️  No candidates found.")
+#             return []
+
+#         # STEP 4: Rerank
+#         print(f"\n🔹 STEP 4: CrossEncoder Reranking with Intent-Based Boost")
+        
+#         # Filter out empty or very short documents
+#         valid_combined = [doc for doc in combined if doc.page_content and len(doc.page_content.strip()) > 10]
+#         print(f"    Valid candidates after filtering: {len(valid_combined)}")
+        
+#         if not valid_combined:
+#             print("    ⚠️ No valid candidates for reranking")
+#             return []
+        
+#         reranker = load_reranker()
+        
+#         # Truncate content to avoid model limits
+#         MAX_CONTENT_LENGTH = 512
+#         pairs = [[query, doc.page_content[:MAX_CONTENT_LENGTH]] for doc in valid_combined]
+        
+#         try:
+#             print(f"    Scoring {len(pairs)} document pairs...")
+            
+#             # Process in smaller batches to avoid hanging
+#             BATCH_SIZE = 16
+#             scores = []
+            
+#             for i in range(0, len(pairs), BATCH_SIZE):
+#                 batch = pairs[i:i + BATCH_SIZE]
+#                 batch_num = (i // BATCH_SIZE) + 1
+#                 total_batches = (len(pairs) + BATCH_SIZE - 1) // BATCH_SIZE
+#                 print(f"    Processing batch {batch_num}/{total_batches} ({len(batch)} pairs)...")
+                
+#                 try:
+#                     batch_scores = reranker.predict(batch)
+#                     scores.extend(batch_scores)
+#                 except Exception as batch_error:
+#                     print(f"    ⚠️ Batch {batch_num} failed: {batch_error}")
+#                     # Use fallback scores for this batch
+#                     scores.extend([0.0] * len(batch))
+            
+#             print(f"    ✅ Reranking complete: {len(scores)} scores generated")
+            
+#             if len(scores) == 0:
+#                 print(f"    ⚠️ Reranker returned empty scores")
+#                 return []
+                
+#         except Exception as e:
+#             print(f"    ❌ Reranking failed: {e}")
+#             import traceback
+#             traceback.print_exc()
+#             # Fallback: use uniform scores
+#             scores = [0.0] * len(valid_combined)
+#             print(f"    ⚠️ Using fallback uniform scores")
+
+#         # Apply web boost (additive so higher = better, even when scores are negative)
+#         boosted_scores = []
+#         for doc, score in zip(valid_combined, scores):
+#             if doc.metadata.get("source_type") == "web":
+#                 boosted_score = score + web_boost
+#             else:
+#                 boosted_score = score
+#             boosted_scores.append(boosted_score)
+
+#         ranked = sorted(
+#             zip(valid_combined, boosted_scores, scores),  # Keep original scores
+#             key=lambda x: x[1],  # Sort by boosted score
+#             reverse=True
+#         )
+        
+#         print(f"    Original score range: {max(scores):.4f} → {min(scores):.4f}")
+#         print(f"    Boosted score range:  {max(boosted_scores):.4f} → {min(boosted_scores):.4f}")
+#         print(f"    Top 3 boosted scores: {[f'{bs:.4f}' for _, bs, _ in ranked[:3]]}")
+
+#         # STEP 5: Threshold filter
+#         print(f"\n🔹 STEP 5: Relevance Filter (boosted >= {RELEVANCE_THRESHOLD})")
+#         above = [(d, bs, os) for d, bs, os in ranked if bs >= RELEVANCE_THRESHOLD]
+#         below = [(d, bs, os) for d, bs, os in ranked if bs < RELEVANCE_THRESHOLD]
+#         print(f"    Above threshold: {len(above)}   |   Discarded (below threshold): {len(below)}")
+
+#         if not above:
+#             # No hits above threshold → just take the best overall
+#             print(f"    ⚠️ All scores below threshold ({RELEVANCE_THRESHOLD})")
+#             print(f"    Best score was: {ranked[0][1]:.4f}")
+#             print(f"    Taking top {top_n} by boosted score anyway...")
+#             candidate_pool = ranked[:top_n]
+#         elif len(above) >= top_n:
+#             # Plenty of good hits → just use the top-N above threshold
+#             candidate_pool = above[:top_n]
+#         else:
+#             # Too few above threshold → fill the rest from below-threshold docs
+#             need = top_n - len(above)
+#             print(f"    ℹ️  Only {len(above)} above threshold — adding {need} best below-threshold docs")
+#             candidate_pool = above + below[:need]
+
+#         # Extract final docs
+#         final_docs = [doc for doc, _, _ in candidate_pool]
+        
+#         actual_web = sum(1 for d in final_docs if d.metadata.get("source_type") == "web")
+#         actual_pdf = sum(1 for d in final_docs if d.metadata.get("source_type") == "pdf")
+
+#         # Summary
+#         print(f"\n📊 FINAL RESULTS:")
+#         print("=" * 70)
+#         print(f"    • Web  : {actual_web}")
+#         print(f"    • PDF  : {actual_pdf}")
+#         print(f"    • Total: {len(final_docs)} (target: {top_n})")
+
+#         for i, (doc, boosted, original) in enumerate(candidate_pool, 1):
+#             stype = doc.metadata.get("source_type", "?")
+#             icon = "🌐" if stype == "web" else "📑"
+#             name = doc.metadata.get("page_name") or doc.metadata.get("source_pdf", "Unknown")
+#             boost_note = f" (from {original:.4f})" if boosted != original else ""
+            
+#             print(f"\n    {i}. {icon} [{stype.upper()}] {name}")
+#             print(f"       Score: {boosted:.4f}{boost_note}")
+#             print(f"       Preview: {doc.page_content[:100]}...")
+
+#         print("\n" + "=" * 70 + "\n")
+#         return final_docs
+
+#     except Exception as e:
+#         print(f"\n❌ RETRIEVAL ERROR: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return []
