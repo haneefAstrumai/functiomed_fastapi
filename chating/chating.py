@@ -19,6 +19,7 @@ vector_store = None
 llm = ChatGroq(
     model="qwen/qwen3-32b",
     temperature=0,
+    top_p=0.9,
     max_tokens=2000,  # safer token limit
     reasoning_format="parsed",
     timeout=None,
@@ -86,6 +87,13 @@ If the DOCUMENT CONTEXT contains any of these, you MUST answer from it and must
 NOT say "not contained". PDF snippets from registration forms or consent text
 count as containing registration information.
 
+AVAILABILITY / OPENING HOURS: Questions like "open hours", "opening hours",
+"When is X available?", "When can I train?", "Öffnungszeiten" must be answered
+using any opening hours / days / times found in the DOCUMENT CONTEXT (even if
+the context is in German and the user asks in English). If the context contains
+ÖFFNUNGSZEITEN / opening times or explicit times (e.g. 07:00–19:00), you MUST
+answer from it and must NOT say "not contained".
+
 ────────────────────────────────────
 DECISION RULES (STRICT):
 1. Greetings, small talk, or identity questions  
@@ -94,7 +102,7 @@ DECISION RULES (STRICT):
    → Do NOT use document context
 
 2. ONLY if the answer truly cannot be found or inferred from the document context  
-   (no contact details, no booking/termin/registration/Anmeldung info, no forms, no relevant services)
+   (no contact details, no booking/termin/registration/Anmeldung info, no opening hours/Öffnungszeiten/availability info, no forms, no relevant services)
    → Respond EXACTLY with:
    German:
    "Diese Information ist in den Dokumenten nicht enthalten."

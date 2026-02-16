@@ -231,6 +231,67 @@ def _deduplicate(docs: list) -> list:
     return unique
 
 
+def _heuristic_sort_when_reranker_disabled(query: str, docs: list) -> list:
+    """
+    Lightweight heuristic sorting used when CrossEncoder reranking is disabled.
+    Helps ensure common "opening hours / availability" questions surface the
+    correct page chunks (e.g., functioTraining opening hours) in the top-N.
+    """
+    q = (query or "").lower()
+    wants_hours = any(
+        t in q
+        for t in (
+            "opening hours",
+            "open hours",
+            "öffnungszeiten",
+            "oeffnungszeiten",
+            "when is",
+            "wann",
+            "available",
+            "availability",
+            "open",
+            "geöffnet",
+            "geoeffnet",
+        )
+    )
+    if not wants_hours or not docs:
+        return docs
+
+    time_re = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+    scored = []
+    for idx, doc in enumerate(docs):
+        name = (
+            (doc.metadata.get("page_name") or doc.metadata.get("source_pdf") or "")
+            .lower()
+            .strip()
+        )
+        content = (doc.page_content or "").lower()
+
+        score = 0
+
+        # Prefer the actual functioTraining pages
+        if "functiotraining" in name:
+            score += 12
+        if "angebot_functiotraining" in name or "en_angebot_functiotraining" in name:
+            score += 20
+
+        # Prefer chunks that mention opening hours / training area hours
+        if "öffnungszeiten" in content or "oeffnungszeiten" in content or "opening hours" in content:
+            score += 10
+        if "trainingsfläche" in content or "trainingsflaeche" in content or "trainingsfla" in content:
+            score += 6
+
+        # Prefer chunks that contain explicit time patterns
+        if time_re.search(content):
+            score += 3
+
+        scored.append((score, idx, doc))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [d for _, __, d in scored]
+
+
 # ─────────────────────────────────────────────
 # MAIN RETRIEVAL
 # ─────────────────────────────────────────────
@@ -308,6 +369,7 @@ def retrieve(query: str, top_n: int = 6) -> list:
         # STEP 4: Rerank (optional; disable to avoid OOM/timeout — set RERANKER_ENABLED=1 to enable)
         if not RERANKER_ENABLED:
             print(f"\n🔹 STEP 4: Reranking disabled — using combined order for top {top_n}")
+            combined = _heuristic_sort_when_reranker_disabled(query, combined)
             final_docs = combined[:top_n]
             actual_web = sum(1 for d in final_docs if d.metadata.get("source_type") == "web")
             actual_pdf = sum(1 for d in final_docs if d.metadata.get("source_type") == "pdf")
@@ -345,6 +407,7 @@ def retrieve(query: str, top_n: int = 6) -> list:
                 scores.extend(reranker.predict(batch))
         except Exception as rerank_err:
             print(f"    ⚠️  Reranker failed: {rerank_err} — using combined order for top {top_n}")
+            combined = _heuristic_sort_when_reranker_disabled(query, combined)
             final_docs = combined[:top_n]
             actual_web = sum(1 for d in final_docs if d.metadata.get("source_type") == "web")
             actual_pdf = sum(1 for d in final_docs if d.metadata.get("source_type") == "pdf")
