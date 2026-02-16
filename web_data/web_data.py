@@ -18,8 +18,8 @@
 # # ─────────────────────────────────────────────────────────────
 
 # def get_all_text_with_metadata(
-#     chunk_size: int = 1000,
-#     chunk_overlap: int = 200,
+#     chunk_size: int = 800,
+#     chunk_overlap: int = 100,
 # ) -> List[Document]:
 #     """
 #     Load ALL .txt files from CLEAN_DIR, assign metadata,
